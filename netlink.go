@@ -386,7 +386,7 @@ func ConnectNetlink() (*IscsiIpcConn, error) {
 // have one outstanding request we're waiting for...)
 func (c *IscsiIpcConn) WaitFor(Type IscsiEvent) (*syscall.NetlinkMessage, error) {
 	for {
-		msgs, err := c.Conn.Receive()
+		msgs, _, err := c.Conn.Receive()
 
 		if err != nil {
 			return nil, err
