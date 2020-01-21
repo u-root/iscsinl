@@ -386,7 +386,7 @@ func ConnectNetlink() (*IscsiIpcConn, error) {
 // have one outstanding request we're waiting for...)
 func (c *IscsiIpcConn) WaitFor(Type IscsiEvent) (*syscall.NetlinkMessage, error) {
 	for {
-		msgs, err := c.Conn.Receive()
+		msgs, _, err := c.Conn.Receive()
 
 		if err != nil {
 			return nil, err
@@ -472,14 +472,14 @@ func (c *IscsiIpcConn) DoNetlink(ueventP unsafe.Pointer, data ...interface{}) er
 
 // CreateSession creates a new kernel iSCSI session, returning the new
 // iscsi_session id and scsi_host id
-func (c *IscsiIpcConn) CreateSession() (sid uint32, hostID uint32, err error) {
+func (c *IscsiIpcConn) CreateSession(cmdsMax uint16, queueDepth uint16) (sid uint32, hostID uint32, err error) {
 	cSession := iSCSIUEventCreateSession{
 		Type:            ISCSI_UEVENT_CREATE_SESSION,
 		IfError:         0,
 		TransportHandle: c.TransportHandle,
 	}
-	cSession.CSession.CmdsMax = 16
-	cSession.CSession.QueueDepth = 16
+	cSession.CSession.CmdsMax = cmdsMax
+	cSession.CSession.QueueDepth = queueDepth
 
 	if err := c.DoNetlink(unsafe.Pointer(&cSession)); err != nil {
 		return 0, 0, err

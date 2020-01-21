@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -144,54 +145,143 @@ func ReReadPartitionTable(devname string) error {
 	return err
 }
 
+// IscsiOptions configures iSCSI session.
+type IscsiOptions struct {
+	Address string
+	Volume  string
+
+	// See RFC7143 Section 13 for these.
+	// Max data per single incoming iSCSI packet
+	MaxRecvDLength int
+	// Max data per single outgoing iSCSI packet
+	MaxXmitDLength int
+	// Max unsolicited data per iSCSI command sequence
+	FirstBurstLength int
+	// Max data per iSCSI command sequence
+	MaxBurstLength int
+	// CRC32C or None
+	HeaderDigest string
+	// CRC32C or None
+	DataDigest string
+	// Seconds to wait for heartbeat response before declaring the connection dead
+	PingTimeout int32
+	// Seconds to wait on an idle connection before sending a heartbeat
+	RecvTimeout int32
+	// Max iSCSI commands outstanding
+	CmdsMax uint16
+	// Max IOs outstanding
+	QueueDepth uint16
+	// Require initial Ready To Transfer (R2T) (false enables unsolicited data)
+	InitialR2T bool
+	// Enable iSCSI Immediate Data
+	ImmediateData bool
+	// Require iSCSI data sequence to be sent order by offset
+	DataPDUInOrder bool
+	// Require packets in an iSCSI data sequence to be sent in order by sequence number
+	DataSequenceInOrder bool
+
+	// Scheduler to configure for the blockdev
+	Scheduler string
+}
+
 // IscsiTargetSession represents an iSCSI session and a single connection to a target
 type IscsiTargetSession struct {
-	addr   string
-	volume string
+	opts   IscsiOptions
 	cid    uint32
 	hostID uint32
 	sid    uint32
 
 	// Update this on login response
-	tsih           uint16
-	expCmdSN       uint32
-	maxCmdSN       uint32
-	expStatSN      uint32
-	currStage      IscsiLoginStage
-	maxRecvDlength int
-	maxXmitDlength int
-	headerDigest   string
-	dataDigest     string
+	tsih      uint16
+	expCmdSN  uint32
+	maxCmdSN  uint32
+	expStatSN uint32
+	currStage IscsiLoginStage
 
 	// Seconds to wait for heartbeat response before declaring the connection dead
 	pingTimeout int32
 	// Seconds to wait on an idle connection before sending a heartbeat
 	recvTimeout int32
 
+	blockDevName string
+
 	conn    *net.TCPConn
 	netlink *IscsiIpcConn
 }
 
-// NewSession constructs an IscsiTargetSession
-func NewSession(addr string, volumeName string, netlink *IscsiIpcConn) *IscsiTargetSession {
-	return &IscsiTargetSession{
-		addr:           addr,
-		volume:         volumeName,
-		netlink:        netlink,
-		maxRecvDlength: 1048576,
-		maxXmitDlength: 1048576,
-		headerDigest:   "CRC32C",
-		dataDigest:     "CRC32C",
-		pingTimeout:    60,
-		recvTimeout:    60,
+const (
+	oneMegabyte = 1048576
+	oneMinute   = 60
+)
+
+var defaultOpts = IscsiOptions{
+	MaxRecvDLength:      oneMegabyte,
+	MaxXmitDLength:      oneMegabyte,
+	FirstBurstLength:    oneMegabyte,
+	MaxBurstLength:      oneMegabyte,
+	HeaderDigest:        "CRC32C",
+	DataDigest:          "CRC32C",
+	PingTimeout:         oneMinute,
+	RecvTimeout:         oneMinute,
+	CmdsMax:             128,
+	QueueDepth:          16,
+	InitialR2T:          false,
+	ImmediateData:       true,
+	DataPDUInOrder:      true,
+	DataSequenceInOrder: true,
+	Scheduler:           "noop",
+}
+
+// Option is a functional API for setting optional configuration.
+type Option func(i *IscsiOptions)
+
+// WithTarget adds the target address and volume to the config.
+func WithTarget(addr, volume string) Option {
+	return func(i *IscsiOptions) {
+		i.Address = addr
+		i.Volume = volume
 	}
+}
+
+// WithCmdsMax sets the maximum number of outstanding iSCSI commands.
+func WithCmdsMax(n uint16) Option {
+	return func(i *IscsiOptions) {
+		i.CmdsMax = n
+	}
+}
+
+// WithQueueDepth sets the maximum number of outstanding IOs.
+func WithQueueDepth(n uint16) Option {
+	return func(i *IscsiOptions) {
+		i.QueueDepth = n
+	}
+}
+
+// WithScheduler sets the block device scheduler.
+func WithScheduler(sched string) Option {
+	return func(i *IscsiOptions) {
+		i.Scheduler = sched
+	}
+}
+
+// NewSession constructs an IscsiTargetSession
+func NewSession(netlink *IscsiIpcConn, opts ...Option) *IscsiTargetSession {
+	i := &IscsiTargetSession{
+		opts:    defaultOpts,
+		netlink: netlink,
+	}
+	// Apply optional arguments from user.
+	for _, opt := range opts {
+		opt(&i.opts)
+	}
+	return i
 }
 
 // Connect creates a kernel iSCSI session and connection, connects to the
 // target, and binds the connection to the kernel session.
 func (s *IscsiTargetSession) Connect() error {
 	var err error
-	s.sid, s.hostID, err = s.netlink.CreateSession()
+	s.sid, s.hostID, err = s.netlink.CreateSession(s.opts.CmdsMax, s.opts.QueueDepth)
 	if err != nil {
 		return err
 	}
@@ -201,7 +291,7 @@ func (s *IscsiTargetSession) Connect() error {
 		return err
 	}
 
-	resolvedAddr, err := net.ResolveTCPAddr("tcp", s.addr)
+	resolvedAddr, err := net.ResolveTCPAddr("tcp", s.opts.Address)
 	if err != nil {
 		return err
 	}
@@ -245,6 +335,22 @@ func bool2str(pred bool) string {
 	return "0"
 }
 
+func iscsiParseBool(inval string) (bool, error) {
+	if inval == "Yes" {
+		return true, nil
+	} else if inval == "No" {
+		return false, nil
+	}
+	return false, fmt.Errorf("invalid bool: %s", inval)
+}
+
+func iscsiBoolStr(pred bool) string {
+	if pred {
+		return "Yes"
+	}
+	return "No"
+}
+
 // SetParams sets some desired parameters for the kernel session
 func (s *IscsiTargetSession) SetParams() error {
 
@@ -252,14 +358,21 @@ func (s *IscsiTargetSession) SetParams() error {
 		p IscsiParam
 		v string
 	}{
-		{ISCSI_PARAM_TARGET_NAME, s.volume},
+		{ISCSI_PARAM_TARGET_NAME, s.opts.Volume},
 		{ISCSI_PARAM_INITIATOR_NAME, "iscsi_startup.go"},
-		{ISCSI_PARAM_MAX_RECV_DLENGTH, fmt.Sprintf("%d", s.maxRecvDlength)},
-		{ISCSI_PARAM_MAX_XMIT_DLENGTH, fmt.Sprintf("%d", s.maxXmitDlength)},
-		{ISCSI_PARAM_HDRDGST_EN, bool2str(s.headerDigest == "CRC32C")},
-		{ISCSI_PARAM_DATADGST_EN, bool2str(s.dataDigest == "CRC32C")},
-		{ISCSI_PARAM_PING_TMO, fmt.Sprintf("%d", s.pingTimeout)},
-		{ISCSI_PARAM_RECV_TMO, fmt.Sprintf("%d", s.recvTimeout)},
+		{ISCSI_PARAM_MAX_RECV_DLENGTH, fmt.Sprintf("%d", s.opts.MaxRecvDLength)},
+		{ISCSI_PARAM_MAX_XMIT_DLENGTH, fmt.Sprintf("%d", s.opts.MaxXmitDLength)},
+		{ISCSI_PARAM_FIRST_BURST, fmt.Sprintf("%d", s.opts.FirstBurstLength)},
+		{ISCSI_PARAM_MAX_BURST, fmt.Sprintf("%d", s.opts.MaxBurstLength)},
+		{ISCSI_PARAM_PDU_INORDER_EN, bool2str(s.opts.DataPDUInOrder)},
+		{ISCSI_PARAM_DATASEQ_INORDER_EN, bool2str(s.opts.DataSequenceInOrder)},
+		{ISCSI_PARAM_INITIAL_R2T_EN, bool2str(s.opts.InitialR2T)},
+		{ISCSI_PARAM_IMM_DATA_EN, bool2str(s.opts.ImmediateData)},
+		{ISCSI_PARAM_EXP_STATSN, fmt.Sprintf("%d", s.expStatSN)},
+		{ISCSI_PARAM_HDRDGST_EN, bool2str(s.opts.HeaderDigest == "CRC32C")},
+		{ISCSI_PARAM_DATADGST_EN, bool2str(s.opts.DataDigest == "CRC32C")},
+		{ISCSI_PARAM_PING_TMO, fmt.Sprintf("%d", s.opts.PingTimeout)},
+		{ISCSI_PARAM_RECV_TMO, fmt.Sprintf("%d", s.opts.RecvTimeout)},
 	}
 
 	for _, pp := range params {
@@ -271,37 +384,44 @@ func (s *IscsiTargetSession) SetParams() error {
 	return nil
 }
 
-// Scan triggers a scsi host scan so the kernel creates a block device for the
-// newly attached session, then waits for the block device to be created and
-// returns the device name.
-func (s *IscsiTargetSession) Scan() (string, error) {
-
-	file, err := os.OpenFile(fmt.Sprintf("/sys/class/scsi_host/host%d/scan", s.hostID), os.O_WRONLY, 0)
+// writeFile is ioutil.WriteFile but disallows creating new file
+func writeFile(filename string, contents string) error {
+	file, err := os.OpenFile(filename, os.O_WRONLY, 0)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if _, err := file.WriteString("- - 1"); err != nil {
-		file.Close()
-		return "", err
+	wlen, err := file.WriteString(contents)
+	if err != nil && wlen < len(contents) {
+		err = io.ErrShortWrite
 	}
 	// If Close() fails this likely indicates a write failure.
-	if err := file.Close(); err != nil {
-		return "", err
+	if errClose := file.Close(); err == nil {
+		err = errClose
+	}
+	return err
+}
+
+// ReScan triggers a scsi host scan so the kernel creates a block device for the
+// newly attached session, then waits for the block device to be created
+func (s *IscsiTargetSession) ReScan() error {
+	if err := writeFile(fmt.Sprintf("/sys/class/scsi_host/host%d/scan", s.hostID), "- - 1"); err != nil {
+		return err
 	}
 
 	var matches []string
 	for {
+		var err error
 		log.Printf("Waiting for device...")
 		time.Sleep(30 * time.Millisecond)
 		matches, err = filepath.Glob(fmt.Sprintf(
 			"/sys/class/iscsi_session/session%d/device/target*/*/block/*/uevent", s.sid))
 
 		if err != nil {
-			return "", err
+			return err
 		}
 
 		if len(matches) > 1 {
-			return "", fmt.Errorf("unexpected number of targets attached to session: %d", len(matches))
+			return fmt.Errorf("unexpected number of targets attached to session: %d", len(matches))
 		} else if len(matches) == 1 {
 			break
 		}
@@ -309,16 +429,50 @@ func (s *IscsiTargetSession) Scan() (string, error) {
 
 	contents, err := ioutil.ReadFile(matches[0])
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	for _, kv := range strings.Split(string(contents), "\n") {
 		splitkv := strings.Split(kv, "=")
 		if splitkv[0] == "DEVNAME" {
-			return splitkv[1], nil
+			s.blockDevName = splitkv[1]
+			return nil
 		}
 	}
-	return "", errors.New("could not find DEVNAME")
+	return errors.New("could not find DEVNAME")
+}
+
+// ConfigureBlockDev will set blockdev params for this iSCSI session, and returns blockdev name
+func (s *IscsiTargetSession) ConfigureBlockDev() (string, error) {
+	if err := s.ReScan(); err != nil {
+		return "", err
+	}
+
+	for {
+		log.Printf("Waiting for sysfs...")
+		time.Sleep(30 * time.Millisecond)
+		_, err := os.Stat(fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName))
+		if !os.IsNotExist(err) {
+			break
+		}
+	}
+
+	params := []struct {
+		filen string
+		val   string
+	}{
+		{fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName), fmt.Sprintf("%d", s.opts.QueueDepth)},
+		{fmt.Sprintf("/sys/block/%v/queue/scheduler", s.blockDevName), s.opts.Scheduler},
+		{fmt.Sprintf("/sys/block/%v/queue/rotational", s.blockDevName), "0"},
+	}
+
+	for _, pp := range params {
+		if err := writeFile(pp.filen, pp.val); err != nil {
+			return "", err
+		}
+	}
+
+	return s.blockDevName, nil
 }
 
 // processOperationalParam assigns params returned from the target. Errors if
@@ -335,16 +489,52 @@ func (s *IscsiTargetSession) processOperationalParam(keyvalue string) error {
 	}
 
 	switch key {
+	case "HeaderDigest":
+		s.opts.HeaderDigest = value
+	case "DataDigest":
+		s.opts.DataDigest = value
+	case "InitialR2T":
+		val, err := iscsiParseBool(value)
+		if err != nil {
+			return err
+		}
+		s.opts.InitialR2T = val || s.opts.InitialR2T
+	case "ImmediateData":
+		val, err := iscsiParseBool(value)
+		if err != nil {
+			return err
+		}
+		s.opts.ImmediateData = val && s.opts.ImmediateData
 	case "MaxRecvDataSegmentLength":
 		length, err := strconv.ParseInt(value, 10, 32)
 		if err != nil {
 			return err
 		}
-		s.maxXmitDlength = int(length)
-	case "HeaderDigest":
-		s.headerDigest = value
-	case "DataDigest":
-		s.dataDigest = value
+		s.opts.MaxXmitDLength = int(length)
+	case "MaxBurstLength":
+		length, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return err
+		}
+		s.opts.MaxBurstLength = int(length)
+	case "FirstBurstLength":
+		length, err := strconv.ParseInt(value, 10, 32)
+		if err != nil {
+			return err
+		}
+		s.opts.FirstBurstLength = int(length)
+	case "DataPDUInOrder":
+		val, err := iscsiParseBool(value)
+		if err != nil {
+			return err
+		}
+		s.opts.DataPDUInOrder = val || s.opts.DataPDUInOrder
+	case "DataSequenceInOrder":
+		val, err := iscsiParseBool(value)
+		if err != nil {
+			return err
+		}
+		s.opts.DataSequenceInOrder = val || s.opts.DataSequenceInOrder
 	default:
 		log.Printf("Ignoring unknown param \"%v\"", keyvalue)
 	}
@@ -421,7 +611,7 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 		hton48(&loginReq.Header.Isid, int(s.sid))
 		loginReq.AddParam("AuthMethod=None")
 		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
-		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.volume))
+		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 
 		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
 			return fmt.Errorf("sendPDU: %v", err)
@@ -449,11 +639,17 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
 		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
-		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.volume))
+		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 		loginReq.AddParam("SessionType=Normal")
-		loginReq.AddParam(fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.maxRecvDlength))
-		loginReq.AddParam(fmt.Sprintf("HeaderDigest=%v", s.headerDigest))
-		loginReq.AddParam(fmt.Sprintf("DataDigest=%v", s.dataDigest))
+		loginReq.AddParam(fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength))
+		loginReq.AddParam(fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength))
+		loginReq.AddParam(fmt.Sprintf("MaxBurstLength=%d", s.opts.MaxBurstLength))
+		loginReq.AddParam(fmt.Sprintf("HeaderDigest=%v", s.opts.HeaderDigest))
+		loginReq.AddParam(fmt.Sprintf("DataDigest=%v", s.opts.DataDigest))
+		loginReq.AddParam(fmt.Sprintf("InitialR2T=%v", iscsiBoolStr(s.opts.InitialR2T)))
+		loginReq.AddParam(fmt.Sprintf("ImmediateData=%v", iscsiBoolStr(s.opts.ImmediateData)))
+		loginReq.AddParam(fmt.Sprintf("DataPDUInOrder=%v", iscsiBoolStr(s.opts.DataPDUInOrder)))
+		loginReq.AddParam(fmt.Sprintf("DataSequenceInOrder=%v", iscsiBoolStr(s.opts.DataSequenceInOrder)))
 
 		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
 			return fmt.Errorf("sendpdu2: %v", err)
@@ -473,19 +669,18 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 
 // MountIscsi connects to the given iscsi target and mounts it, returning the
 // device name on success
-func MountIscsi(address string, volume string) (string, error) {
+func MountIscsi(opts ...Option) (string, error) {
 	netlink, err := ConnectNetlink()
 	if err != nil {
-		return "", fmt.Errorf("netlink: %v", err)
+		return "", err
 	}
-
 	// We use local hostname to identify ourselves to the target
 	hostname, err := os.Hostname()
 	if err != nil {
 		return "", err
 	}
 
-	session := NewSession(address, volume, netlink)
+	session := NewSession(netlink, opts...)
 	if err = session.Connect(); err != nil {
 		return "", fmt.Errorf("connect: %v", err)
 	}
@@ -502,7 +697,7 @@ func MountIscsi(address string, volume string) (string, error) {
 		return "", fmt.Errorf("start: %v", err)
 	}
 
-	devname, err := session.Scan()
+	devname, err := session.ConfigureBlockDev()
 	if err != nil {
 		return "", err
 	}

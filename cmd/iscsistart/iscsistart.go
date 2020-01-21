@@ -12,6 +12,9 @@ var (
 	volumeName      = flag.String("volume", "FOO", "volume name")
 	monitorNetlink  = flag.Bool("monitorNetlink", false, "Set to true to monitor netlink socket until killed")
 	teardownSession = flag.Int("teardownSid", -1, "Set to teardown a session")
+	cmdsMax         = flag.Int("cmdsMax", 128, "Max outstanding iSCSI commands")
+	queueDepth      = flag.Int("queueDepth", 16, "Max outstanding IOs")
+	scheduler       = flag.String("scheduler", "noop", "block scheduler for session")
 )
 
 func main() {
@@ -24,7 +27,12 @@ func main() {
 		return
 	}
 
-	device, err := iscsinl.MountIscsi(*targetAddr, *volumeName)
+	device, err := iscsinl.MountIscsi(
+		iscsinl.WithTarget(*targetAddr, *volumeName),
+		iscsinl.WithCmdsMax(uint16(*cmdsMax)),
+		iscsinl.WithQueueDepth(uint16(*queueDepth)),
+		iscsinl.WithScheduler(*scheduler),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
