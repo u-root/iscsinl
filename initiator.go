@@ -310,6 +310,9 @@ func (s *IscsiTargetSession) Connect() error {
 	}
 
 	file, err := s.conn.File()
+	if err != nil {
+		return err
+	}
 	defer file.Close()
 	fd := file.Fd()
 
