@@ -27,6 +27,8 @@ github.com/google/goterm v0.0.0-20190703233501-fc88cf888a3f/go.mod h1:nOFQdrUlIl
 github.com/gorilla/mux v1.7.2/go.mod h1:1lud6UwP+6orDFRuTfBEV8e9/aOM/c4fVVCaMa2zaAs=
 github.com/gostor/gotgt v0.1.0 h1:Ecwc8qr8dZZAG3IbDgjpdu/X3oXPbAcCcEqbrSx0OZk=
 github.com/gostor/gotgt v0.1.0/go.mod h1:rgMRljJIVT/xrgSGSSsqE+0TZt2CG3Gg3JNjzB08uok=
+github.com/gostor/gotgt v0.1.1-0.20200122071503-48fe2a9b6ed0 h1:xQlMQoci68wUD7B5uQb9D4wPU/dJFAnCGs/+J/wFTtw=
+github.com/gostor/gotgt v0.1.1-0.20200122071503-48fe2a9b6ed0/go.mod h1:rgMRljJIVT/xrgSGSSsqE+0TZt2CG3Gg3JNjzB08uok=
 github.com/hashicorp/hcl v1.0.0/go.mod h1:E5yfLk+7swimpb2L/Alb/PJmXilQ/rhwaUYs4T20WEQ=
 github.com/hugelgupf/gotgt v0.0.0-20200122064518-6af024c2e322 h1:Has2+5NIMl6sixR6xsrh/ou0zO4wFGHT0MnJLjpiHfQ=
 github.com/hugelgupf/gotgt v0.0.0-20200122064518-6af024c2e322/go.mod h1:TpDqAWFhRAsHfWHFvSRB8HZlvOmDxZEwDuSEjy0rbAU=
