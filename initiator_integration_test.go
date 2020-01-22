@@ -29,7 +29,7 @@ import (
 func ISCSIConfig(filename, volume, portal string) *iscsiconfig.Config {
 	return &iscsiconfig.Config{
 		Storages: []iscsiconfig.BackendStorage{
-			iscsiconfig.BackendStorage{
+			{
 				DeviceID:         1000,
 				Path:             fmt.Sprintf("file:%s", filename),
 				Online:           true,
@@ -38,16 +38,16 @@ func ISCSIConfig(filename, volume, portal string) *iscsiconfig.Config {
 			},
 		},
 		ISCSIPortals: []iscsiconfig.ISCSIPortalInfo{
-			iscsiconfig.ISCSIPortalInfo{
+			{
 				ID:     0,
 				Portal: portal,
 			},
 		},
 		ISCSITargets: map[string]iscsiconfig.ISCSITarget{
-			volume: iscsiconfig.ISCSITarget{
+			volume: {
 				TPGTs: map[string][]uint64{
 					// ???
-					"1": []uint64{0},
+					"1": {0},
 				},
 				LUNs: map[string]uint64{
 					// Map LUN ID to DeviceID (see above).
