@@ -264,6 +264,14 @@ func WithScheduler(sched string) Option {
 	}
 }
 
+// WithDigests sets both the header and data digest. Acceptable values: None or CRC32C.
+func WithDigests(digest string) Option {
+	return func(i *IscsiOptions) {
+		i.HeaderDigest = digest
+		i.DataDigest = digest
+	}
+}
+
 // NewSession constructs an IscsiTargetSession
 func NewSession(netlink *IscsiIpcConn, opts ...Option) *IscsiTargetSession {
 	i := &IscsiTargetSession{
@@ -328,7 +336,7 @@ func (s *IscsiTargetSession) TearDown() error {
 	return nil
 }
 
-func bool2str(pred bool) string {
+func netlinkBoolStr(pred bool) string {
 	if pred {
 		return "1"
 	}
@@ -353,7 +361,6 @@ func iscsiBoolStr(pred bool) string {
 
 // SetParams sets some desired parameters for the kernel session
 func (s *IscsiTargetSession) SetParams() error {
-
 	params := []struct {
 		p IscsiParam
 		v string
@@ -364,13 +371,13 @@ func (s *IscsiTargetSession) SetParams() error {
 		{ISCSI_PARAM_MAX_XMIT_DLENGTH, fmt.Sprintf("%d", s.opts.MaxXmitDLength)},
 		{ISCSI_PARAM_FIRST_BURST, fmt.Sprintf("%d", s.opts.FirstBurstLength)},
 		{ISCSI_PARAM_MAX_BURST, fmt.Sprintf("%d", s.opts.MaxBurstLength)},
-		{ISCSI_PARAM_PDU_INORDER_EN, bool2str(s.opts.DataPDUInOrder)},
-		{ISCSI_PARAM_DATASEQ_INORDER_EN, bool2str(s.opts.DataSequenceInOrder)},
-		{ISCSI_PARAM_INITIAL_R2T_EN, bool2str(s.opts.InitialR2T)},
-		{ISCSI_PARAM_IMM_DATA_EN, bool2str(s.opts.ImmediateData)},
+		{ISCSI_PARAM_PDU_INORDER_EN, netlinkBoolStr(s.opts.DataPDUInOrder)},
+		{ISCSI_PARAM_DATASEQ_INORDER_EN, netlinkBoolStr(s.opts.DataSequenceInOrder)},
+		{ISCSI_PARAM_INITIAL_R2T_EN, netlinkBoolStr(s.opts.InitialR2T)},
+		{ISCSI_PARAM_IMM_DATA_EN, netlinkBoolStr(s.opts.ImmediateData)},
 		{ISCSI_PARAM_EXP_STATSN, fmt.Sprintf("%d", s.expStatSN)},
-		{ISCSI_PARAM_HDRDGST_EN, bool2str(s.opts.HeaderDigest == "CRC32C")},
-		{ISCSI_PARAM_DATADGST_EN, bool2str(s.opts.DataDigest == "CRC32C")},
+		{ISCSI_PARAM_HDRDGST_EN, netlinkBoolStr(s.opts.HeaderDigest == "CRC32C")},
+		{ISCSI_PARAM_DATADGST_EN, netlinkBoolStr(s.opts.DataDigest == "CRC32C")},
 		{ISCSI_PARAM_PING_TMO, fmt.Sprintf("%d", s.opts.PingTimeout)},
 		{ISCSI_PARAM_RECV_TMO, fmt.Sprintf("%d", s.opts.RecvTimeout)},
 	}
@@ -580,6 +587,9 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) error {
 
 	// dLength generally != the length of the rest of the netlink buffer
 	dLength := int(ntoh24(loginRespPdu.DLength))
+	if dLength == 0 {
+		return nil
+	}
 	theRest := make([]byte, dLength)
 	read, err := reader.Read(theRest)
 	if err != nil {
