@@ -147,6 +147,7 @@ func ReReadPartitionTable(devname string) error {
 
 // IscsiOptions configures iSCSI session.
 type IscsiOptions struct {
+	InitiatorName string
 	Address string
 	Volume  string
 
@@ -240,6 +241,13 @@ func WithTarget(addr, volume string) Option {
 	return func(i *IscsiOptions) {
 		i.Address = addr
 		i.Volume = volume
+	}
+}
+
+// WithInitiator adds the initiator name to the config.
+func WithInitiator(initiatorName string) Option {
+	return func(i *IscsiOptions) {
+		i.InitiatorName = initiatorName
 	}
 }
 
@@ -369,7 +377,7 @@ func (s *IscsiTargetSession) SetParams() error {
 		v string
 	}{
 		{ISCSI_PARAM_TARGET_NAME, s.opts.Volume},
-		{ISCSI_PARAM_INITIATOR_NAME, "iscsi_startup.go"},
+		{ISCSI_PARAM_INITIATOR_NAME, s.opts.InitiatorName},
 		{ISCSI_PARAM_MAX_RECV_DLENGTH, fmt.Sprintf("%d", s.opts.MaxRecvDLength)},
 		{ISCSI_PARAM_MAX_XMIT_DLENGTH, fmt.Sprintf("%d", s.opts.MaxXmitDLength)},
 		{ISCSI_PARAM_FIRST_BURST, fmt.Sprintf("%d", s.opts.FirstBurstLength)},
@@ -386,7 +394,7 @@ func (s *IscsiTargetSession) SetParams() error {
 	}
 
 	for _, pp := range params {
-		log.Printf("Setting param %v to %v", pp.p, pp.v)
+		log.Printf("Setting param %s to %v", pp.p.String(), pp.v)
 		if err := s.netlink.SetParam(s.sid, s.cid, pp.p, pp.v); err != nil {
 			return err
 		}
@@ -623,7 +631,7 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
 		loginReq.AddParam("AuthMethod=None")
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
+		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
 		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 
 		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
@@ -651,7 +659,7 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 			},
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
+		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
 		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 		loginReq.AddParam("SessionType=Normal")
 		loginReq.AddParam(fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength))

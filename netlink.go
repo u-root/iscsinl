@@ -84,6 +84,33 @@ const (
 	ISCSI_PARAM_INITIATOR_NAME
 )
 
+var paramToString = map[IscsiParam]string {
+	ISCSI_PARAM_TARGET_NAME: "Target Name",
+	ISCSI_PARAM_INITIATOR_NAME: "Inititator Name",
+	ISCSI_PARAM_MAX_RECV_DLENGTH: "Max Recv DLength",
+	ISCSI_PARAM_MAX_XMIT_DLENGTH: "Max Xmit DLenght",
+	ISCSI_PARAM_FIRST_BURST: "First Burst",
+	ISCSI_PARAM_MAX_BURST: "Max Burst",
+	ISCSI_PARAM_PDU_INORDER_EN: "PDU Inorder EN",
+	ISCSI_PARAM_DATASEQ_INORDER_EN: "Data Seq In Order EN",
+	ISCSI_PARAM_INITIAL_R2T_EN: "Inital R2T EN",
+	ISCSI_PARAM_IMM_DATA_EN: "Immediate Data EN",
+	ISCSI_PARAM_EXP_STATSN: "Exp Statsn",
+	ISCSI_PARAM_HDRDGST_EN: "HDR Digest EN",
+	ISCSI_PARAM_DATADGST_EN: "Data Digest EN",
+	ISCSI_PARAM_PING_TMO: "Ping TMO",
+	ISCSI_PARAM_RECV_TMO: "Recv TMO",
+}
+
+func (p IscsiParam) String() string {
+	val, ok := paramToString[p] 
+	if !ok {
+		return fmt.Sprintf("IscsiParam(%d)", int(p))
+	}
+
+	return val
+}
+
 // IscsiErr iscsi_if.h:enum iscsi_err
 type IscsiErr uint32
 

@@ -9,6 +9,7 @@ import (
 
 var (
 	targetAddr      = flag.String("addr", "instance-1:3260", "target addr")
+	initiatorName   = flag.String("i", "hostname:iscsi_startup.go", "initiator name")
 	volumeName      = flag.String("volume", "FOO", "volume name")
 	monitorNetlink  = flag.Bool("monitorNetlink", false, "Set to true to monitor netlink socket until killed")
 	teardownSession = flag.Int("teardownSid", -1, "Set to teardown a session")
@@ -28,6 +29,7 @@ func main() {
 	}
 
 	device, err := iscsinl.MountIscsi(
+		iscsinl.WithInitiator(*initiatorName),
 		iscsinl.WithTarget(*targetAddr, *volumeName),
 		iscsinl.WithCmdsMax(uint16(*cmdsMax)),
 		iscsinl.WithQueueDepth(uint16(*queueDepth)),
