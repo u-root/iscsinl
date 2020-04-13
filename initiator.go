@@ -147,6 +147,7 @@ func ReReadPartitionTable(devname string) error {
 
 // IscsiOptions configures iSCSI session.
 type IscsiOptions struct {
+	InitiatorName string
 	Address string
 	Volume  string
 
@@ -240,6 +241,13 @@ func WithTarget(addr, volume string) Option {
 	return func(i *IscsiOptions) {
 		i.Address = addr
 		i.Volume = volume
+	}
+}
+
+// WithInitiator adds the initiator name to the config.
+func WithInitiator(initiatorName string) Option {
+	return func(i *IscsiOptions) {
+		i.InitiatorName = initiatorName
 	}
 }
 
@@ -366,27 +374,28 @@ func iscsiBoolStr(pred bool) string {
 func (s *IscsiTargetSession) SetParams() error {
 	params := []struct {
 		p IscsiParam
+        s string
 		v string
 	}{
-		{ISCSI_PARAM_TARGET_NAME, s.opts.Volume},
-		{ISCSI_PARAM_INITIATOR_NAME, "iscsi_startup.go"},
-		{ISCSI_PARAM_MAX_RECV_DLENGTH, fmt.Sprintf("%d", s.opts.MaxRecvDLength)},
-		{ISCSI_PARAM_MAX_XMIT_DLENGTH, fmt.Sprintf("%d", s.opts.MaxXmitDLength)},
-		{ISCSI_PARAM_FIRST_BURST, fmt.Sprintf("%d", s.opts.FirstBurstLength)},
-		{ISCSI_PARAM_MAX_BURST, fmt.Sprintf("%d", s.opts.MaxBurstLength)},
-		{ISCSI_PARAM_PDU_INORDER_EN, netlinkBoolStr(s.opts.DataPDUInOrder)},
-		{ISCSI_PARAM_DATASEQ_INORDER_EN, netlinkBoolStr(s.opts.DataSequenceInOrder)},
-		{ISCSI_PARAM_INITIAL_R2T_EN, netlinkBoolStr(s.opts.InitialR2T)},
-		{ISCSI_PARAM_IMM_DATA_EN, netlinkBoolStr(s.opts.ImmediateData)},
-		{ISCSI_PARAM_EXP_STATSN, fmt.Sprintf("%d", s.expStatSN)},
-		{ISCSI_PARAM_HDRDGST_EN, netlinkBoolStr(s.opts.HeaderDigest == "CRC32C")},
-		{ISCSI_PARAM_DATADGST_EN, netlinkBoolStr(s.opts.DataDigest == "CRC32C")},
-		{ISCSI_PARAM_PING_TMO, fmt.Sprintf("%d", s.opts.PingTimeout)},
-		{ISCSI_PARAM_RECV_TMO, fmt.Sprintf("%d", s.opts.RecvTimeout)},
+		{ISCSI_PARAM_TARGET_NAME, "Target Name", s.opts.Volume},
+		{ISCSI_PARAM_INITIATOR_NAME, "Inititator Name", s.opts.InitiatorName},
+		{ISCSI_PARAM_MAX_RECV_DLENGTH, "Max Recv DLength", fmt.Sprintf("%d", s.opts.MaxRecvDLength)},
+		{ISCSI_PARAM_MAX_XMIT_DLENGTH, "Max Xmit DLenght", fmt.Sprintf("%d", s.opts.MaxXmitDLength)},
+		{ISCSI_PARAM_FIRST_BURST, "First Burst", fmt.Sprintf("%d", s.opts.FirstBurstLength)},
+		{ISCSI_PARAM_MAX_BURST, "Max Burst", fmt.Sprintf("%d", s.opts.MaxBurstLength)},
+		{ISCSI_PARAM_PDU_INORDER_EN, "PDU Inorder EN", netlinkBoolStr(s.opts.DataPDUInOrder)},
+		{ISCSI_PARAM_DATASEQ_INORDER_EN, "Data Seq In Order EN", netlinkBoolStr(s.opts.DataSequenceInOrder)},
+		{ISCSI_PARAM_INITIAL_R2T_EN, "Inital R2T EN", netlinkBoolStr(s.opts.InitialR2T)},
+		{ISCSI_PARAM_IMM_DATA_EN, "Immediate Data EN", netlinkBoolStr(s.opts.ImmediateData)},
+		{ISCSI_PARAM_EXP_STATSN, "Exp Statsn", fmt.Sprintf("%d", s.expStatSN)},
+		{ISCSI_PARAM_HDRDGST_EN, "HDR Digest EN", netlinkBoolStr(s.opts.HeaderDigest == "CRC32C")},
+		{ISCSI_PARAM_DATADGST_EN, "Data Digest EN", netlinkBoolStr(s.opts.DataDigest == "CRC32C")},
+		{ISCSI_PARAM_PING_TMO, "Ping TMO", fmt.Sprintf("%d", s.opts.PingTimeout)},
+		{ISCSI_PARAM_RECV_TMO, "Recv TMO", fmt.Sprintf("%d", s.opts.RecvTimeout)},
 	}
 
 	for _, pp := range params {
-		log.Printf("Setting param %v to %v", pp.p, pp.v)
+		log.Printf("Setting param %s to %v", pp.s, pp.v)
 		if err := s.netlink.SetParam(s.sid, s.cid, pp.p, pp.v); err != nil {
 			return err
 		}
@@ -623,7 +632,7 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
 		loginReq.AddParam("AuthMethod=None")
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
+		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
 		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 
 		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
@@ -651,7 +660,7 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 			},
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s:iscsi_startup.go", hostname))
+		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
 		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 		loginReq.AddParam("SessionType=Normal")
 		loginReq.AddParam(fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength))
