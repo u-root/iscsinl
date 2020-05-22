@@ -148,8 +148,8 @@ func ReReadPartitionTable(devname string) error {
 // IscsiOptions configures iSCSI session.
 type IscsiOptions struct {
 	InitiatorName string
-	Address string
-	Volume  string
+	Address       string
+	Volume        string
 
 	// See RFC7143 Section 13 for these.
 	// Max data per single incoming iSCSI packet
@@ -204,7 +204,7 @@ type IscsiTargetSession struct {
 	// Seconds to wait on an idle connection before sending a heartbeat
 	recvTimeout int32
 
-	blockDevName string
+	blockDevName []string
 
 	conn    *net.TCPConn
 	netlink *IscsiIpcConn
@@ -422,12 +422,13 @@ func writeFile(filename string, contents string) error {
 // ReScan triggers a scsi host scan so the kernel creates a block device for the
 // newly attached session, then waits for the block device to be created
 func (s *IscsiTargetSession) ReScan() error {
-	if err := writeFile(fmt.Sprintf("/sys/class/scsi_host/host%d/scan", s.hostID), "- - 1"); err != nil {
+	// The three wildcards stand for channel, SCSI target ID, and LUN.
+	if err := writeFile(fmt.Sprintf("/sys/class/scsi_host/host%d/scan", s.hostID), "- - -"); err != nil {
 		return err
 	}
 
 	var matches []string
-	for {
+	for i := 0; i < 10; i++ {
 		var err error
 		log.Printf("Waiting for device...")
 		time.Sleep(30 * time.Millisecond)
@@ -437,59 +438,62 @@ func (s *IscsiTargetSession) ReScan() error {
 		if err != nil {
 			return err
 		}
+	}
 
-		if len(matches) > 1 {
-			return fmt.Errorf("unexpected number of targets attached to session: %d", len(matches))
-		} else if len(matches) == 1 {
-			break
+	found := false
+	for _, match := range matches {
+		contents, err := ioutil.ReadFile(match)
+		if err != nil {
+			log.Printf("error reading file for %v err=%v skipping error\n", match, err)
+			continue
+		}
+
+		for _, kv := range strings.Split(string(contents), "\n") {
+			splitkv := strings.Split(kv, "=")
+			if splitkv[0] == "DEVNAME" {
+				s.blockDevName = append(s.blockDevName, splitkv[1])
+				found = true
+			}
 		}
 	}
 
-	contents, err := ioutil.ReadFile(matches[0])
-	if err != nil {
-		return err
+	if !found {
+		return errors.New("could not find DEVNAME")
 	}
+	return nil
 
-	for _, kv := range strings.Split(string(contents), "\n") {
-		splitkv := strings.Split(kv, "=")
-		if splitkv[0] == "DEVNAME" {
-			s.blockDevName = splitkv[1]
-			return nil
-		}
-	}
-	return errors.New("could not find DEVNAME")
 }
 
-// ConfigureBlockDev will set blockdev params for this iSCSI session, and returns blockdev name
-func (s *IscsiTargetSession) ConfigureBlockDev() (string, error) {
+// ConfigureBlockDevs will set blockdev params for this iSCSI session, and returns blockdev name
+func (s *IscsiTargetSession) ConfigureBlockDevs() ([]string, error) {
 	if err := s.ReScan(); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	for {
-		log.Printf("Waiting for sysfs...")
-		time.Sleep(30 * time.Millisecond)
-		_, err := os.Stat(fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName))
-		if !os.IsNotExist(err) {
-			break
+	for i := range s.blockDevName {
+		for {
+			log.Printf("Waiting for sysfs...")
+			time.Sleep(30 * time.Millisecond)
+			_, err := os.Stat(fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName[i]))
+			if !os.IsNotExist(err) {
+				break
+			}
+		}
+		params := []struct {
+			filen string
+			val   string
+		}{
+			{fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName[i]), fmt.Sprintf("%d", s.opts.QueueDepth)},
+			{fmt.Sprintf("/sys/block/%v/queue/scheduler", s.blockDevName[i]), s.opts.Scheduler},
+			{fmt.Sprintf("/sys/block/%v/queue/rotational", s.blockDevName[i]), "0"},
+		}
+
+		for _, pp := range params {
+			if err := writeFile(pp.filen, pp.val); err != nil {
+				return nil, err
+			}
 		}
 	}
-
-	params := []struct {
-		filen string
-		val   string
-	}{
-		{fmt.Sprintf("/sys/block/%v/queue/nr_requests", s.blockDevName), fmt.Sprintf("%d", s.opts.QueueDepth)},
-		{fmt.Sprintf("/sys/block/%v/queue/scheduler", s.blockDevName), s.opts.Scheduler},
-		{fmt.Sprintf("/sys/block/%v/queue/rotational", s.blockDevName), "0"},
-	}
-
-	for _, pp := range params {
-		if err := writeFile(pp.filen, pp.val); err != nil {
-			return "", err
-		}
-	}
-
 	return s.blockDevName, nil
 }
 
@@ -615,7 +619,7 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) error {
 // Login - RFC iSCSI login
 // https://www.ietf.org/rfc/rfc3720.txt
 // For now "negotiates" no auth security.
-func (s *IscsiTargetSession) Login(hostname string) error {
+func (s *IscsiTargetSession) Login() error {
 	log.Println("Starting login...")
 
 	for s.currStage != ISCSI_OP_PARMS_NEGOTIATION_STAGE {
@@ -690,43 +694,41 @@ func (s *IscsiTargetSession) Login(hostname string) error {
 
 // MountIscsi connects to the given iscsi target and mounts it, returning the
 // device name on success
-func MountIscsi(opts ...Option) (string, error) {
+func MountIscsi(opts ...Option) ([]string, error) {
 	netlink, err := ConnectNetlink()
 	if err != nil {
-		return "", err
-	}
-	// We use local hostname to identify ourselves to the target
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	session := NewSession(netlink, opts...)
 	if err = session.Connect(); err != nil {
-		return "", fmt.Errorf("connect: %v", err)
+		return nil, fmt.Errorf("connect: %v", err)
 	}
 
-	if err := session.Login(hostname); err != nil {
-		return "", fmt.Errorf("login: %v", err)
+	if err := session.Login(); err != nil {
+		return nil, fmt.Errorf("login: %v", err)
 	}
 
 	if err := session.SetParams(); err != nil {
-		return "", fmt.Errorf("params: %v", err)
+		return nil, fmt.Errorf("params: %v", err)
 	}
 
 	if err := session.Start(); err != nil {
-		return "", fmt.Errorf("start: %v", err)
+		return nil, fmt.Errorf("start: %v", err)
 	}
 
-	devname, err := session.ConfigureBlockDev()
+	devnames, err := session.ConfigureBlockDevs()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	if err := ReReadPartitionTable("/dev/" + devname); err != nil {
-		return "", err
+	for i := range devnames {
+		if err := ReReadPartitionTable("/dev/" + devnames[i]); err != nil {
+			return nil, err
+		}
 	}
-	return devname, nil
+
+	return devnames, nil
 }
 
 // TearDownIscsi tears down the specified session
