@@ -635,6 +635,10 @@ func (s *IscsiTargetSession) Login() error {
 		}
 		hton48(&loginReq.Header.Isid, int(s.sid))
 		loginReq.AddParam("AuthMethod=None")
+		// RFC 3720 page 36 last line, https://tools.ietf.org/html/rfc3720#page-36
+		// The session type is defined during login with the key=value parameter
+		// in the login command.
+		loginReq.AddParam("SessionType=Normal")
 		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
 		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
 
