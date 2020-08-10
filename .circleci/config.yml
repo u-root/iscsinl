@@ -10,6 +10,7 @@ templates:
       - CGO_ENABLED: 0
       # Double all timeouts for QEMU VM tests since they run without KVM.
       - UROOT_QEMU_TIMEOUT_X: 2
+      - GO111MODULE: "off"
 
 workflows:
   version: 2
