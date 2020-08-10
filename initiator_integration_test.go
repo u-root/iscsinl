@@ -22,7 +22,6 @@ import (
 
 	"github.com/hugelgupf/p9/fsimpl/test/vmdriver"
 	"github.com/u-root/u-root/pkg/qemu"
-	"github.com/u-root/u-root/pkg/uroot"
 	"github.com/u-root/u-root/pkg/vmtest"
 )
 
@@ -99,12 +98,6 @@ func TestIntegration(t *testing.T) {
 	vmtest.GolangTest(t,
 		[]string{"github.com/u-root/iscsinl"},
 		&vmtest.Options{
-			BuildOpts: uroot.Opts{
-				Commands: uroot.BusyBoxCmds(
-					"github.com/u-root/u-root/cmds/core/dhclient",
-					"github.com/u-root/u-root/cmds/core/ls",
-				),
-			},
 			QEMUOpts: qemu.Options{
 				Devices: []qemu.Device{
 					vmdriver.HostNetwork{
