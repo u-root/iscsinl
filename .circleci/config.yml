@@ -3,7 +3,7 @@ version: 2
 templates:
   golang-template: &golang-template
     docker:
-      - image: uroottest/test-image-amd64:v3.2.10
+      - image: uroottest/test-image-amd64:v3.2.13
     working_directory: /go/src/github.com/u-root/iscsinl
     environment:
       - GOPATH: "/go"
