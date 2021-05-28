@@ -4,7 +4,7 @@
 
 package iscsinl
 
-import (
+/*import (
 	"fmt"
 	"log"
 	"os"
@@ -57,4 +57,4 @@ func TestMountIscsi(t *testing.T) {
 			t.Error(err)
 		}
 	}
-}
+}*/
