@@ -698,9 +698,6 @@ func (s *IscsiTargetSession) Login() error {
 	log.Println("login: param negotiation")
 
 	queue = append(queue, []string{
-		fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName),
-		fmt.Sprintf("TargetName=%s", s.opts.Volume),
-		"SessionType=Normal",
 		fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength),
 		fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength),
 		fmt.Sprintf("MaxBurstLength=%d", s.opts.MaxBurstLength),
