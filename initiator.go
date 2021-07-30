@@ -5,6 +5,7 @@ package iscsinl
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -195,6 +196,7 @@ type IscsiTargetSession struct {
 	cid    uint32
 	hostID uint32
 	sid    uint32
+	isid   [6]byte
 
 	// Update this on login response
 	tsih      uint16
@@ -292,11 +294,19 @@ func WithDigests(digest string) Option {
 	}
 }
 
+func generateIsid() [6]byte {
+	isid := [6]byte{}
+	isid[0] = 0x2 << 6 // random isid identifier. See RFC3720 p157
+	rand.Read(isid[1:])
+	return isid
+}
+
 // NewSession constructs an IscsiTargetSession
 func NewSession(netlink *IscsiIpcConn, opts ...Option) *IscsiTargetSession {
 	i := &IscsiTargetSession{
 		opts:    defaultOpts,
 		netlink: netlink,
+		isid:    generateIsid(),
 	}
 	// Apply optional arguments from user.
 	for _, opt := range opts {
@@ -678,7 +688,8 @@ func (s *IscsiTargetSession) Login() error {
 				Flags:      uint8((s.currStage << 2) | ISCSI_OP_PARMS_NEGOTIATION_STAGE | ISCSI_FLAG_LOGIN_TRANSIT),
 			},
 		}
-		hton48(&loginReq.Header.Isid, int(s.sid))
+		//hton48(&loginReq.Header.Isid, int(s.sid))
+		loginReq.Header.Isid = s.isid
 		for _, p := range queue {
 			loginReq.AddParam(p)
 		}
@@ -720,7 +731,8 @@ func (s *IscsiTargetSession) Login() error {
 				Flags:      uint8((s.currStage << 2) | ISCSI_FULL_FEATURE_PHASE | ISCSI_FLAG_LOGIN_TRANSIT),
 			},
 		}
-		hton48(&loginReq.Header.Isid, int(s.sid))
+		//hton48(&loginReq.Header.Isid, int(s.sid))
+		loginReq.Header.Isid = s.isid
 		for _, p := range queue {
 			loginReq.AddParam(p)
 		}
