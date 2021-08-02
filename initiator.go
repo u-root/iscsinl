@@ -44,6 +44,23 @@ const (
 	ISCSI_FULL_FEATURE_PHASE                         = 3
 )
 
+// Status classes
+type IscsiStatusClass uint8
+
+const (
+	ISCSI_STATUS_CLASS_SUCCESS         IscsiStatusClass = 0
+	ISCSI_STATUS_CLASS_REDIRECTION                      = 1
+	ISCSI_STATUS_CLASS_INITIATOR_ERROR                  = 2
+	ISCSI_STATUS_CLASS_TARGET_ERROR                     = 3
+)
+
+var IscsiStatusErrors = map[IscsiStatusClass]error{
+	ISCSI_STATUS_CLASS_SUCCESS:         nil,
+	ISCSI_STATUS_CLASS_REDIRECTION:     fmt.Errorf("target requested redirection"),
+	ISCSI_STATUS_CLASS_INITIATOR_ERROR: fmt.Errorf("initiator error"),
+	ISCSI_STATUS_CLASS_TARGET_ERROR:    fmt.Errorf("target error"),
+}
+
 func hton24(buf *[3]byte, num int) {
 	buf[0] = uint8(((num) >> 16) & 0xFF)
 	buf[1] = uint8(((num) >> 8) & 0xFF)
@@ -98,7 +115,7 @@ type LoginRspHdr struct {
 	StatSN        uint32
 	ExpCmdSN      uint32
 	MaxCmdSN      uint32
-	StatusClass   uint8
+	StatusClass   IscsiStatusClass
 	StatusDetail  uint8
 	Rsvd5         [10]uint8
 }
@@ -210,6 +227,9 @@ type IscsiTargetSession struct {
 	// Seconds to wait on an idle connection before sending a heartbeat
 	recvTimeout int32
 
+	Retries int           // number of retries remaining on this session
+	Backoff time.Duration // how long to sleep between retries
+
 	blockDevName []string
 
 	conn    *net.TCPConn
@@ -307,6 +327,9 @@ func NewSession(netlink *IscsiIpcConn, opts ...Option) *IscsiTargetSession {
 		opts:    defaultOpts,
 		netlink: netlink,
 		isid:    generateIsid(),
+		// default to 3 retries and a 1 second backoff
+		Retries: 3,
+		Backoff: time.Second,
 	}
 	// Apply optional arguments from user.
 	for _, opt := range opts {
@@ -623,6 +646,7 @@ func (s *IscsiTargetSession) processOperationalParams(data []byte) ([]string, er
 	return queue, nil
 }
 
+// it might make sense to start using github.com/pkg/errors so the wrapping function can do error typing
 func (s *IscsiTargetSession) processLoginResponse(response []byte) ([]string, error) {
 	var loginRespPdu LoginRspHdr
 	reader := bytes.NewReader(response)
@@ -633,8 +657,9 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) ([]string, er
 		return []string{}, fmt.Errorf("unexpected response pdu opcode %d", loginRespPdu.Opcode)
 	}
 
-	if loginRespPdu.StatusClass != 0 {
-		return []string{}, fmt.Errorf("error in login response %d %d", loginRespPdu.StatusClass, loginRespPdu.StatusDetail)
+	if loginRespPdu.StatusClass != ISCSI_STATUS_CLASS_SUCCESS {
+		// we don't return status detail just so we can do simple error typing
+		return []string{}, IscsiStatusErrors[loginRespPdu.StatusClass]
 	}
 
 	s.maxCmdSN = loginRespPdu.MaxCmdSN
@@ -667,6 +692,50 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) ([]string, er
 func (s *IscsiTargetSession) Login() error {
 	log.Println("login: starting")
 
+	// we rely on some variables in outer scope, so we don't break this out as a separate function
+	handleLoginStage := func(queue []string, next IscsiLoginStage) error {
+		for s.currStage != next {
+			loginReq := IscsiLoginPdu{
+				Header: LoginHdr{
+					Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
+					MaxVersion: ISCSI_VERSION,
+					MinVersion: ISCSI_VERSION,
+					ExpStatSN:  s.expStatSN,
+					Tsih:       s.tsih,
+					Flags:      uint8((s.currStage << 2) | next | ISCSI_FLAG_LOGIN_TRANSIT),
+				},
+			}
+			loginReq.Header.Isid = s.isid
+			for _, p := range queue {
+				loginReq.AddParam(p)
+			}
+			if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
+				return fmt.Errorf("sendPDU: %v", err)
+			}
+			response, err := s.netlink.RecvPDU(s.sid, s.cid)
+			if err != nil {
+				return fmt.Errorf("recvpdu: %v", err)
+			}
+			if queue, err = s.processLoginResponse(response); err != nil {
+				if err == IscsiStatusErrors[ISCSI_STATUS_CLASS_TARGET_ERROR] {
+					if s.Retries > 0 {
+						s.Retries--
+						log.Printf("login failed with target error, retrying in %s", s.Backoff.String())
+						s.TearDown() // check error?
+						time.Sleep(s.Backoff)
+						if err = s.Connect(); err != nil {
+							return fmt.Errorf("failed to reconnect on retry: %v", err)
+						}
+						return s.Login()
+					} else {
+						return fmt.Errorf("maximum retries exceeded")
+					}
+				}
+				return err
+			}
+		}
+		return nil
+	}
 	queue := []string{
 		"AuthMethod=None",
 		// RFC 3720 page 36 last line, https://tools.ietf.org/html/rfc3720#page-36
@@ -676,38 +745,11 @@ func (s *IscsiTargetSession) Login() error {
 		fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName),
 		fmt.Sprintf("TargetName=%s", s.opts.Volume),
 	}
-
-	for s.currStage != ISCSI_OP_PARMS_NEGOTIATION_STAGE {
-		loginReq := IscsiLoginPdu{
-			Header: LoginHdr{
-				Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
-				MaxVersion: ISCSI_VERSION,
-				MinVersion: ISCSI_VERSION,
-				ExpStatSN:  s.expStatSN,
-				Tsih:       s.tsih,
-				Flags:      uint8((s.currStage << 2) | ISCSI_OP_PARMS_NEGOTIATION_STAGE | ISCSI_FLAG_LOGIN_TRANSIT),
-			},
-		}
-		//hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.Header.Isid = s.isid
-		for _, p := range queue {
-			loginReq.AddParam(p)
-		}
-
-		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
-			return fmt.Errorf("sendPDU: %v", err)
-		}
-
-		response, err := s.netlink.RecvPDU(s.sid, s.cid)
-		if err != nil {
-			return fmt.Errorf("recvpdu: %v", err)
-		}
-		if queue, err = s.processLoginResponse(response); err != nil {
-			return err
-		}
+	if err := handleLoginStage(queue, ISCSI_OP_PARMS_NEGOTIATION_STAGE); err != nil {
+		return err
 	}
-	log.Println("login: param negotiation")
 
+	log.Println("login: param negotiation")
 	queue = append(queue, []string{
 		fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength),
 		fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength),
@@ -719,36 +761,10 @@ func (s *IscsiTargetSession) Login() error {
 		fmt.Sprintf("DataPDUInOrder=%v", iscsiBoolStr(s.opts.DataPDUInOrder)),
 		fmt.Sprintf("DataSequenceInOrder=%v", iscsiBoolStr(s.opts.DataSequenceInOrder)),
 	}...)
-
-	for s.currStage != ISCSI_FULL_FEATURE_PHASE {
-		loginReq := IscsiLoginPdu{
-			Header: LoginHdr{
-				Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
-				MaxVersion: ISCSI_VERSION,
-				MinVersion: ISCSI_VERSION,
-				ExpStatSN:  s.expStatSN,
-				Tsih:       s.tsih,
-				Flags:      uint8((s.currStage << 2) | ISCSI_FULL_FEATURE_PHASE | ISCSI_FLAG_LOGIN_TRANSIT),
-			},
-		}
-		//hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.Header.Isid = s.isid
-		for _, p := range queue {
-			loginReq.AddParam(p)
-		}
-
-		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
-			return fmt.Errorf("sendpdu2: %v", err)
-		}
-
-		response, err := s.netlink.RecvPDU(s.sid, s.cid)
-		if err != nil {
-			return fmt.Errorf("recvpdu2: %v", err)
-		}
-		if queue, err = s.processLoginResponse(response); err != nil {
-			return err
-		}
+	if err := handleLoginStage(queue, ISCSI_FULL_FEATURE_PHASE); err != nil {
+		return err
 	}
+
 	log.Println("login: finished")
 	return nil
 }
