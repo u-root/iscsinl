@@ -154,7 +154,7 @@ func (l *IscsiLoginPdu) AddParam(keyvalue string) {
 
 // ReReadPartitionTable opens the given file and reads partition table from it
 func ReReadPartitionTable(devname string) error {
-	f, err := os.OpenFile(devname, os.O_RDWR, 0)
+	f, err := os.OpenFile(devname, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -242,12 +242,12 @@ const (
 )
 
 var defaultOpts = IscsiOptions{
-	MaxRecvDLength:      oneMegabyte,
-	MaxXmitDLength:      oneMegabyte,
-	FirstBurstLength:    oneMegabyte,
-	MaxBurstLength:      oneMegabyte,
-	HeaderDigest:        "CRC32C",
-	DataDigest:          "CRC32C",
+	MaxRecvDLength:      262144,
+	MaxXmitDLength:      262144,
+	FirstBurstLength:    262144,
+	MaxBurstLength:      16776192,
+	HeaderDigest:        "None",
+	DataDigest:          "None",
 	PingTimeout:         oneMinute,
 	RecvTimeout:         oneMinute,
 	CmdsMax:             128,
@@ -256,7 +256,7 @@ var defaultOpts = IscsiOptions{
 	ImmediateData:       true,
 	DataPDUInOrder:      true,
 	DataSequenceInOrder: true,
-	Scheduler:           "noop",
+	Scheduler:           "mq-deadline",
 	ScanTimeout:         3 * time.Second,
 }
 
@@ -736,6 +736,7 @@ func (s *IscsiTargetSession) Login() error {
 		}
 		return nil
 	}
+	/* we can skip auth altogether ...
 	queue := []string{
 		"AuthMethod=None",
 		// RFC 3720 page 36 last line, https://tools.ietf.org/html/rfc3720#page-36
@@ -748,9 +749,22 @@ func (s *IscsiTargetSession) Login() error {
 	if err := handleLoginStage(queue, ISCSI_OP_PARMS_NEGOTIATION_STAGE); err != nil {
 		return err
 	}
+	*/
 
+	// we don't need an auth stage
+	s.currStage = ISCSI_OP_PARMS_NEGOTIATION_STAGE
 	log.Println("login: param negotiation")
-	queue = append(queue, []string{
+	queue := []string{
+		"SessionType=Normal",
+		"DefaultTime2Wait=2",
+		"DefaultTime2Retain=0",
+		"IFMarker=No",
+		"OFMarker=No",
+		"ErrorRecoveryLevel=0",
+		"MaxOutstandingR2T=1",
+		"MaxConnections=1",
+		fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName),
+		fmt.Sprintf("TargetName=%s", s.opts.Volume),
 		fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength),
 		fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength),
 		fmt.Sprintf("MaxBurstLength=%d", s.opts.MaxBurstLength),
@@ -760,7 +774,7 @@ func (s *IscsiTargetSession) Login() error {
 		fmt.Sprintf("ImmediateData=%v", iscsiBoolStr(s.opts.ImmediateData)),
 		fmt.Sprintf("DataPDUInOrder=%v", iscsiBoolStr(s.opts.DataPDUInOrder)),
 		fmt.Sprintf("DataSequenceInOrder=%v", iscsiBoolStr(s.opts.DataSequenceInOrder)),
-	}...)
+	}
 	if err := handleLoginStage(queue, ISCSI_FULL_FEATURE_PHASE); err != nil {
 		return err
 	}
