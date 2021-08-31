@@ -5,6 +5,7 @@ package iscsinl
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -42,6 +43,23 @@ const (
 	ISCSI_OP_PARMS_NEGOTIATION_STAGE                 = 1
 	ISCSI_FULL_FEATURE_PHASE                         = 3
 )
+
+// Status classes
+type IscsiStatusClass uint8
+
+const (
+	ISCSI_STATUS_CLASS_SUCCESS         IscsiStatusClass = 0
+	ISCSI_STATUS_CLASS_REDIRECTION                      = 1
+	ISCSI_STATUS_CLASS_INITIATOR_ERROR                  = 2
+	ISCSI_STATUS_CLASS_TARGET_ERROR                     = 3
+)
+
+var IscsiStatusErrors = map[IscsiStatusClass]error{
+	ISCSI_STATUS_CLASS_SUCCESS:         nil,
+	ISCSI_STATUS_CLASS_REDIRECTION:     fmt.Errorf("target requested redirection"),
+	ISCSI_STATUS_CLASS_INITIATOR_ERROR: fmt.Errorf("initiator error"),
+	ISCSI_STATUS_CLASS_TARGET_ERROR:    fmt.Errorf("target error"),
+}
 
 func hton24(buf *[3]byte, num int) {
 	buf[0] = uint8(((num) >> 16) & 0xFF)
@@ -97,7 +115,7 @@ type LoginRspHdr struct {
 	StatSN        uint32
 	ExpCmdSN      uint32
 	MaxCmdSN      uint32
-	StatusClass   uint8
+	StatusClass   IscsiStatusClass
 	StatusDetail  uint8
 	Rsvd5         [10]uint8
 }
@@ -136,7 +154,7 @@ func (l *IscsiLoginPdu) AddParam(keyvalue string) {
 
 // ReReadPartitionTable opens the given file and reads partition table from it
 func ReReadPartitionTable(devname string) error {
-	f, err := os.OpenFile(devname, os.O_RDWR, 0)
+	f, err := os.OpenFile(devname, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -195,6 +213,7 @@ type IscsiTargetSession struct {
 	cid    uint32
 	hostID uint32
 	sid    uint32
+	isid   [6]byte
 
 	// Update this on login response
 	tsih      uint16
@@ -208,6 +227,9 @@ type IscsiTargetSession struct {
 	// Seconds to wait on an idle connection before sending a heartbeat
 	recvTimeout int32
 
+	Retries int           // number of retries remaining on this session
+	Backoff time.Duration // how long to sleep between retries
+
 	blockDevName []string
 
 	conn    *net.TCPConn
@@ -220,12 +242,12 @@ const (
 )
 
 var defaultOpts = IscsiOptions{
-	MaxRecvDLength:      oneMegabyte,
-	MaxXmitDLength:      oneMegabyte,
-	FirstBurstLength:    oneMegabyte,
-	MaxBurstLength:      oneMegabyte,
-	HeaderDigest:        "CRC32C",
-	DataDigest:          "CRC32C",
+	MaxRecvDLength:      262144,
+	MaxXmitDLength:      262144,
+	FirstBurstLength:    262144,
+	MaxBurstLength:      16776192,
+	HeaderDigest:        "None",
+	DataDigest:          "None",
 	PingTimeout:         oneMinute,
 	RecvTimeout:         oneMinute,
 	CmdsMax:             128,
@@ -234,7 +256,7 @@ var defaultOpts = IscsiOptions{
 	ImmediateData:       true,
 	DataPDUInOrder:      true,
 	DataSequenceInOrder: true,
-	Scheduler:           "noop",
+	Scheduler:           "mq-deadline",
 	ScanTimeout:         3 * time.Second,
 }
 
@@ -292,11 +314,22 @@ func WithDigests(digest string) Option {
 	}
 }
 
+func generateIsid() [6]byte {
+	isid := [6]byte{}
+	isid[0] = 0x2 << 6 // random isid identifier. See RFC3720 p157
+	rand.Read(isid[1:])
+	return isid
+}
+
 // NewSession constructs an IscsiTargetSession
 func NewSession(netlink *IscsiIpcConn, opts ...Option) *IscsiTargetSession {
 	i := &IscsiTargetSession{
 		opts:    defaultOpts,
 		netlink: netlink,
+		isid:    generateIsid(),
+		// default to 3 retries and a 1 second backoff
+		Retries: 3,
+		Backoff: time.Second,
 	}
 	// Apply optional arguments from user.
 	for _, opt := range opts {
@@ -521,15 +554,22 @@ func (s *IscsiTargetSession) ConfigureBlockDevs() ([]string, error) {
 
 // processOperationalParam assigns params returned from the target. Errors if
 // we cannot continue with negotiation.
-func (s *IscsiTargetSession) processOperationalParam(keyvalue string) error {
+func (s *IscsiTargetSession) processOperationalParam(keyvalue string) (string, error) {
 	split := strings.Split(keyvalue, "=")
 	if len(split) != 2 {
-		return fmt.Errorf("invalid format for operational param \"%v\"", keyvalue)
+		return "", fmt.Errorf("invalid format for operational param \"%v\"", keyvalue)
 	}
 	key, value := split[0], split[1]
 
-	if value == "Reject" {
-		return fmt.Errorf("target rejected parameter %q", key)
+	switch value {
+	case "Reject":
+		return "", fmt.Errorf("target rejected parameter %q", key)
+	case "NotUnderstood":
+		log.Printf("target did not understand parameter: %s, continuing\n", key)
+		return "", nil
+	case "Irrelevant":
+		log.Printf("target finds parameter irrelevant: %s, continuing\n", key)
+		return "", nil
 	}
 
 	switch key {
@@ -540,78 +580,86 @@ func (s *IscsiTargetSession) processOperationalParam(keyvalue string) error {
 	case "InitialR2T":
 		val, err := iscsiParseBool(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.InitialR2T = val || s.opts.InitialR2T
 	case "ImmediateData":
 		val, err := iscsiParseBool(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.ImmediateData = val && s.opts.ImmediateData
 	case "MaxRecvDataSegmentLength":
 		length, err := strconv.ParseInt(value, 10, 32)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.MaxXmitDLength = int(length)
 	case "MaxBurstLength":
 		length, err := strconv.ParseInt(value, 10, 32)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.MaxBurstLength = int(length)
 	case "FirstBurstLength":
 		length, err := strconv.ParseInt(value, 10, 32)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.FirstBurstLength = int(length)
 	case "DataPDUInOrder":
 		val, err := iscsiParseBool(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.DataPDUInOrder = val || s.opts.DataPDUInOrder
 	case "DataSequenceInOrder":
 		val, err := iscsiParseBool(value)
 		if err != nil {
-			return err
+			return "", err
 		}
 		s.opts.DataSequenceInOrder = val || s.opts.DataSequenceInOrder
+	case "AuthMethod", "TargetAlias", "TargetPortalGroupTag":
+		// we can safely ignore these
 	default:
-		log.Printf("Ignoring unknown param \"%v\"", keyvalue)
+		log.Printf("Blindly accepting unknown parameter type\"%v\"", keyvalue)
+		return keyvalue, nil
 	}
-	return nil
+	return "", nil
 }
 
 // processOperationalParams processes all parameters in a login response
-func (s *IscsiTargetSession) processOperationalParams(data []byte) error {
+func (s *IscsiTargetSession) processOperationalParams(data []byte) ([]string, error) {
+	queue := []string{}
 	params := strings.Split(string(data), "\x00")
 	// Annoyingly, strings.Split will always have an empty string at the end
 	// An empty string in the middle of params suggests we have an otherwise
 	// malformed request, since we shouldn't expect double nul bytes
 	params = params[0 : len(params)-1]
 	for _, param := range params {
-		if err := s.processOperationalParam(param); err != nil {
-			return err
+		if respond, err := s.processOperationalParam(param); err != nil {
+			return []string{}, err
+		} else if respond != "" {
+			queue = append(queue, respond)
 		}
 	}
-	return nil
+	return queue, nil
 }
 
-func (s *IscsiTargetSession) processLoginResponse(response []byte) error {
+// it might make sense to start using github.com/pkg/errors so the wrapping function can do error typing
+func (s *IscsiTargetSession) processLoginResponse(response []byte) ([]string, error) {
 	var loginRespPdu LoginRspHdr
 	reader := bytes.NewReader(response)
 	if err := binary.Read(reader, binary.LittleEndian, &loginRespPdu); err != nil {
-		return err
+		return []string{}, err
 	}
 	if loginRespPdu.Opcode != ISCSI_OP_LOGIN_RSP {
-		return fmt.Errorf("unexpected response pdu opcode %d", loginRespPdu.Opcode)
+		return []string{}, fmt.Errorf("unexpected response pdu opcode %d", loginRespPdu.Opcode)
 	}
 
-	if loginRespPdu.StatusClass != 0 {
-		return fmt.Errorf("error in login response %d %d", loginRespPdu.StatusClass, loginRespPdu.StatusDetail)
+	if loginRespPdu.StatusClass != ISCSI_STATUS_CLASS_SUCCESS {
+		// we don't return status detail just so we can do simple error typing
+		return []string{}, IscsiStatusErrors[loginRespPdu.StatusClass]
 	}
 
 	s.maxCmdSN = loginRespPdu.MaxCmdSN
@@ -625,15 +673,15 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) error {
 	// dLength generally != the length of the rest of the netlink buffer
 	dLength := int(ntoh24(loginRespPdu.DLength))
 	if dLength == 0 {
-		return nil
+		return []string{}, nil
 	}
 	theRest := make([]byte, dLength)
 	read, err := reader.Read(theRest)
 	if err != nil {
-		return err
+		return []string{}, err
 	}
 	if read != dLength {
-		return errors.New("unexpected EOF reading PDU data")
+		return []string{}, errors.New("unexpected EOF reading PDU data")
 	}
 	return s.processOperationalParams(theRest)
 }
@@ -642,80 +690,97 @@ func (s *IscsiTargetSession) processLoginResponse(response []byte) error {
 // https://www.ietf.org/rfc/rfc3720.txt
 // For now "negotiates" no auth security.
 func (s *IscsiTargetSession) Login() error {
-	log.Println("Starting login...")
+	log.Println("login: starting")
 
-	for s.currStage != ISCSI_OP_PARMS_NEGOTIATION_STAGE {
-		loginReq := IscsiLoginPdu{
-			Header: LoginHdr{
-				Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
-				MaxVersion: ISCSI_VERSION,
-				MinVersion: ISCSI_VERSION,
-				ExpStatSN:  s.expStatSN,
-				Tsih:       s.tsih,
-				Flags:      uint8((s.currStage << 2) | ISCSI_OP_PARMS_NEGOTIATION_STAGE | ISCSI_FLAG_LOGIN_TRANSIT),
-			},
+	// we rely on some variables in outer scope, so we don't break this out as a separate function
+	handleLoginStage := func(queue []string, next IscsiLoginStage) error {
+		for s.currStage != next {
+			loginReq := IscsiLoginPdu{
+				Header: LoginHdr{
+					Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
+					MaxVersion: ISCSI_VERSION,
+					MinVersion: ISCSI_VERSION,
+					ExpStatSN:  s.expStatSN,
+					Tsih:       s.tsih,
+					Flags:      uint8((s.currStage << 2) | next | ISCSI_FLAG_LOGIN_TRANSIT),
+				},
+			}
+			loginReq.Header.Isid = s.isid
+			for _, p := range queue {
+				loginReq.AddParam(p)
+			}
+			if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
+				return fmt.Errorf("sendPDU: %v", err)
+			}
+			response, err := s.netlink.RecvPDU(s.sid, s.cid)
+			if err != nil {
+				return fmt.Errorf("recvpdu: %v", err)
+			}
+			if queue, err = s.processLoginResponse(response); err != nil {
+				if err == IscsiStatusErrors[ISCSI_STATUS_CLASS_TARGET_ERROR] {
+					if s.Retries > 0 {
+						s.Retries--
+						log.Printf("login failed with target error, retrying in %s", s.Backoff.String())
+						s.TearDown() // check error?
+						time.Sleep(s.Backoff)
+						if err = s.Connect(); err != nil {
+							return fmt.Errorf("failed to reconnect on retry: %v", err)
+						}
+						return s.Login()
+					} else {
+						return fmt.Errorf("maximum retries exceeded")
+					}
+				}
+				return err
+			}
 		}
-		hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.AddParam("AuthMethod=None")
+		return nil
+	}
+	/* we can skip auth altogether ...
+	queue := []string{
+		"AuthMethod=None",
 		// RFC 3720 page 36 last line, https://tools.ietf.org/html/rfc3720#page-36
 		// The session type is defined during login with the key=value parameter
 		// in the login command.
-		loginReq.AddParam("SessionType=Normal")
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
-		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
+		"SessionType=Normal",
+		fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName),
+		fmt.Sprintf("TargetName=%s", s.opts.Volume),
+	}
+	if err := handleLoginStage(queue, ISCSI_OP_PARMS_NEGOTIATION_STAGE); err != nil {
+		return err
+	}
+	*/
 
-		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
-			return fmt.Errorf("sendPDU: %v", err)
-		}
-
-		response, err := s.netlink.RecvPDU(s.sid, s.cid)
-		if err != nil {
-			return fmt.Errorf("recvpdu: %v", err)
-		}
-		if err = s.processLoginResponse(response); err != nil {
-			return err
-		}
+	// we don't need an auth stage
+	s.currStage = ISCSI_OP_PARMS_NEGOTIATION_STAGE
+	log.Println("login: param negotiation")
+	queue := []string{
+		"SessionType=Normal",
+		"DefaultTime2Wait=2",
+		"DefaultTime2Retain=0",
+		"IFMarker=No",
+		"OFMarker=No",
+		"ErrorRecoveryLevel=0",
+		"MaxOutstandingR2T=1",
+		"MaxConnections=1",
+		fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName),
+		fmt.Sprintf("TargetName=%s", s.opts.Volume),
+		fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength),
+		fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength),
+		fmt.Sprintf("MaxBurstLength=%d", s.opts.MaxBurstLength),
+		fmt.Sprintf("HeaderDigest=%v", s.opts.HeaderDigest),
+		fmt.Sprintf("DataDigest=%v", s.opts.DataDigest),
+		fmt.Sprintf("InitialR2T=%v", iscsiBoolStr(s.opts.InitialR2T)),
+		fmt.Sprintf("ImmediateData=%v", iscsiBoolStr(s.opts.ImmediateData)),
+		fmt.Sprintf("DataPDUInOrder=%v", iscsiBoolStr(s.opts.DataPDUInOrder)),
+		fmt.Sprintf("DataSequenceInOrder=%v", iscsiBoolStr(s.opts.DataSequenceInOrder)),
+	}
+	if err := handleLoginStage(queue, ISCSI_FULL_FEATURE_PHASE); err != nil {
+		return err
 	}
 
-	for s.currStage != ISCSI_FULL_FEATURE_PHASE {
-		loginReq := IscsiLoginPdu{
-			Header: LoginHdr{
-				Opcode:     ISCSI_OP_LOGIN | ISCSI_OP_IMMEDIATE,
-				MaxVersion: ISCSI_VERSION,
-				MinVersion: ISCSI_VERSION,
-				ExpStatSN:  s.expStatSN,
-				Tsih:       s.tsih,
-				Flags:      uint8((s.currStage << 2) | ISCSI_FULL_FEATURE_PHASE | ISCSI_FLAG_LOGIN_TRANSIT),
-			},
-		}
-		hton48(&loginReq.Header.Isid, int(s.sid))
-		loginReq.AddParam(fmt.Sprintf("InitiatorName=%s", s.opts.InitiatorName))
-		loginReq.AddParam(fmt.Sprintf("TargetName=%s", s.opts.Volume))
-		loginReq.AddParam("SessionType=Normal")
-		loginReq.AddParam(fmt.Sprintf("MaxRecvDataSegmentLength=%d", s.opts.MaxRecvDLength))
-		loginReq.AddParam(fmt.Sprintf("FirstBurstLength=%d", s.opts.FirstBurstLength))
-		loginReq.AddParam(fmt.Sprintf("MaxBurstLength=%d", s.opts.MaxBurstLength))
-		loginReq.AddParam(fmt.Sprintf("HeaderDigest=%v", s.opts.HeaderDigest))
-		loginReq.AddParam(fmt.Sprintf("DataDigest=%v", s.opts.DataDigest))
-		loginReq.AddParam(fmt.Sprintf("InitialR2T=%v", iscsiBoolStr(s.opts.InitialR2T)))
-		loginReq.AddParam(fmt.Sprintf("ImmediateData=%v", iscsiBoolStr(s.opts.ImmediateData)))
-		loginReq.AddParam(fmt.Sprintf("DataPDUInOrder=%v", iscsiBoolStr(s.opts.DataPDUInOrder)))
-		loginReq.AddParam(fmt.Sprintf("DataSequenceInOrder=%v", iscsiBoolStr(s.opts.DataSequenceInOrder)))
-
-		if err := s.netlink.SendPDU(s.sid, s.cid, &loginReq); err != nil {
-			return fmt.Errorf("sendpdu2: %v", err)
-		}
-
-		response, err := s.netlink.RecvPDU(s.sid, s.cid)
-		if err != nil {
-			return fmt.Errorf("recvpdu2: %v", err)
-		}
-		if err = s.processLoginResponse(response); err != nil {
-			return err
-		}
-	}
+	log.Println("login: finished")
 	return nil
-
 }
 
 // MountIscsi connects to the given iscsi target and mounts it, returning the
